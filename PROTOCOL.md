@@ -40,8 +40,8 @@ All multi-byte integers are big-endian unless noted otherwise.
 
 ## 3. Packet Structure
 
-Every packet is wrapped in a transport envelope encrypted with ChaCha20-Poly1305.
-The inner (plaintext) structure is:
+Every packet is wrapped in an outer encryption envelope (see section 4).
+The inner plaintext structure is:
 
 ```
 +---------+-----------+--------------+------------------+
@@ -72,41 +72,94 @@ routes the payload accordingly.
 
 ---
 
-## 4. Transport Handshake
+## 4. Outer Encryption Layer
 
-Before any application message is exchanged, the client and server establish a
-shared ChaCha20-Poly1305 key via an X25519 ECDH handshake.
+There is no transport handshake. Every frame is independently encrypted and
+self-contained. The server's X25519 public keys are compiled into the client
+binary; multiple keys are supported for rotation.
 
-```
-Client                                    Server
-  |                                          |
-  |-- ClientHello: client_x25519_pub(32) --> |
-  |                                          |  derives shared_key =
-  |                                          |  HKDF-SHA256(
-  |                                          |    X25519(server_priv, client_pub),
-  |                                          |    info="nullroute-transport"
-  |                                          |  )
-  |<-- ServerHello: server_x25519_pub(32) ---|
-  |                                          |
-  |  both sides now share the same key       |
-  |  all subsequent packets are encrypted    |
-```
+### 4.1 Client → Server (C2S)
 
-Key derivation:
+Each message uses a freshly generated ephemeral X25519 key. This prevents any
+observer (including the server itself) from linking frames to a specific client
+based on transport-layer data alone.
+
+Wire format:
 ```
-shared_secret = X25519(my_priv, peer_pub)
-transport_key = HKDF-SHA256(shared_secret,
-                             salt=none,
-                             info="nullroute-transport",
-                             length=32)
++----------+-----------------+-------------------+
+| LEN [2]  | EPHEM_PUB  [32] | CIPHERTEXT (var)  |
++----------+-----------------+-------------------+
 ```
 
-Transport packet wire format:
+- `LEN` — byte count after the LEN field: `32 + len(CIPHERTEXT)`
+- `EPHEM_PUB` — one-time X25519 public key, freshly generated per frame
+- `CIPHERTEXT` — ChaCha20-Poly1305 output, includes 16-byte authentication tag
+
+Key and nonce derivation:
 ```
-+------------+---------------------------+----------+
-| NONCE [12] | CIPHERTEXT (variable)     | TAG [16] |
-+------------+---------------------------+----------+
+ephem_priv, ephem_pub = X25519_keygen()
+shared                = X25519(ephem_priv, server_x25519_pub)
+key_nonce             = HKDF-SHA256(shared,
+                                     salt=none,
+                                     info="nullroute-c2s",
+                                     length=44)
+key   = key_nonce[0:32]
+nonce = key_nonce[32:44]
 ```
+
+The nonce is not transmitted — it is derived deterministically from the shared
+secret. Each unique EPHEM_PUB produces a unique shared secret, making nonce
+reuse structurally impossible.
+
+Server decryption:
+```
+shared    = X25519(server_x25519_priv, EPHEM_PUB)
+key_nonce = HKDF-SHA256(shared, info="nullroute-c2s", length=44)
+key, nonce = key_nonce[0:32], key_nonce[32:44]
+inner_packet = ChaCha20-Poly1305_decrypt(key, nonce, CIPHERTEXT)
+// discard frame silently if tag check fails
+```
+
+### 4.2 Server → Client (S2C)
+
+The server encrypts with one of its static X25519 private keys and the
+client's registered X25519 public key. No ephemeral key is included in the
+frame. The client tries each hardcoded server key in turn until decryption
+succeeds.
+
+Wire format:
+```
++----------+-------------------+
+| LEN [2]  | CIPHERTEXT (var)  |
++----------+-------------------+
+```
+
+- `LEN` — byte count after the LEN field: `len(CIPHERTEXT)`
+- `CIPHERTEXT` — `NONCE[12] || ChaCha20-Poly1305 output || TAG[16]`
+
+Server encryption:
+```
+shared = X25519(server_x25519_priv, client_x25519_pub)
+key    = HKDF-SHA256(shared, salt=none, info="nullroute-s2c", length=32)
+nonce  = random(12)
+CIPHERTEXT = nonce || ChaCha20-Poly1305_encrypt(key, nonce, inner_packet)
+```
+
+Client decryption:
+```
+for server_pub in HARDCODED_SERVER_KEYS:
+    shared = X25519(client_x25519_priv, server_pub)
+    key    = HKDF-SHA256(shared, info="nullroute-s2c", length=32)
+    nonce  = CIPHERTEXT[0:12]
+    result = ChaCha20-Poly1305_try_decrypt(key, nonce, CIPHERTEXT[12:])
+    if result is not None:
+        inner_packet = result
+        break
+// discard frame silently if no key matches
+```
+
+When server keys are rotated, the old key stays in `HARDCODED_SERVER_KEYS`
+until all deployed clients have received the new binary.
 
 ---
 
@@ -338,5 +391,6 @@ key because it does not hold either party's X25519 private key.
 | GCM / Poly1305 tag   | 16 bytes |
 | Nonce (both ciphers) | 12 bytes |
 | UID                  | 4 bytes  |
-| Transport overhead   | 28 bytes (nonce + tag) |
+| C2S outer overhead   | 48 bytes (ephem_pub + tag; nonce derived) |
+| S2C outer overhead   | 28 bytes (nonce + tag) |
 | E2E overhead         | 60 bytes (sender_pub + nonce + tag) |
