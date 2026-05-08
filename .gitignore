@@ -20,3 +20,5 @@ CMakeUserPresets.json
 
 server/cpp/build/
 server/cpp/thirdparty/build
+
+__pycache__/
